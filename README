@@ -3,7 +3,7 @@ Here we use ARPACK + MUMPS to solve the eigenvalue problem or svd problem (trans
 ../project zest1_parap to solve the svd problem (frequency range should be set by hand in input_omega.txt)
 ../project zest4 to solve the eigenvalue problem (shifts should be set by hand in shiftOP.txt)
 
-Some example cases: (input matrix are all formed with FreeFem++)
+Some example cases: (input matrices are all formed with FreeFem++)
 1. ../example/cylinder : resolvent anlaysis for cylinder wake
 See {Symon, S., Rosenberg, K., Dawson, S. T., & McKeon, B. J. (2018). Non-normality and classification of amplification mechanisms in stability and resolvent analysis. Physical Review Fluids, 3(5), 053902.}
 2. ../example/Vflame : eigenvalue analysis for Vflame
