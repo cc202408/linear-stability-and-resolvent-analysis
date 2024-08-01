@@ -1,3 +1,15 @@
-Resolvent Analysis
+Here we use ARPACK + MUMPS to solve the eigenvalue problem or svd problem (transferred into an eigenvalue problem) in parallel for flow stability analysis
 
+../project zest1_parap to solve the svd problem (frequency range should be set by hand in input_omega.txt)
+../project zest4 to solve the eigenvalue problem (shifts should be set by hand in shiftOP.txt)
 
+Some example cases: (input matrix are all formed with FreeFem++)
+1. ../example/cylinder : resolvent anlaysis for cylinder wake
+See {Symon, S., Rosenberg, K., Dawson, S. T., & McKeon, B. J. (2018). Non-normality and classification of amplification mechanisms in stability and resolvent analysis. Physical Review Fluids, 3(5), 053902.}
+2. ../example/Vflame : eigenvalue analysis for Vflame
+See {Wang, C., Douglas, C. M., Guan, Y., Xu, C., & Lesshafft, L. (2024). Onset of global instability in a premixed annular V-flame. arXiv preprint arXiv:2404.17396.}
+
+Important: Not a good way to do things like this (especially for better parallizaiton), I suggest the application of PETSc\SLEPc, which can be directly called from FreeFem++.
+These codes may be of a little help to understand the methods of arnoldi iteration.
+
+Thanks very much~
