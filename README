@@ -1,4 +1,5 @@
 Here we use ARPACK + MUMPS to solve the eigenvalue problem or svd problem (transferred into an eigenvalue problem) in parallel for flow stability analysis
+(This project is updated from the example of MUMPS)
 
 ../project zest1_parap to solve the svd problem (frequency range should be set by hand in input_omega.txt)
 ../project zest4 to solve the eigenvalue problem (shifts should be set by hand in shiftOP.txt)
