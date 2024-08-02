@@ -1,0 +1,364 @@
+//
+//  PROGRAM Stab_PREMIXED_LM.edp
+//	
+//	Performs the linear stability analysis of a 2D flow to get A and B matrix
+//   
+//
+//   this solver will use either Arnoldi (if nev>1) or simple Shift-invert (if nev=1)
+//
+//	INPUT FILES :
+//		BaseFlow.txt	-> base flow 
+// 		mesh.msh 			->  mesh in Freefem format
+//  OUTPUT FILES :
+//	single-mode calculation :
+//		Eigenmode.txt   (txt format for FreeFem)
+//      Eigenmode.ff2m  (ff2m format for stabfem)
+// 		EigenmodeA.txt  ADJOINT  (txt format for FreeFem)
+//      EigenmodeA.ff2m ADJOINT  (ff2m format for stabfem)
+//
+// 
+// 	ERROR MANAGEMENT : 
+//      if shift-invert iteration diverges, Error code is 202.
+//
+
+// Lu Chen 2023/4/27
+// Lu Chen 2023/6/30 Low Mach Number flow
+// Lu Chen 2024/3/2 Low Mach Number flow for premixed flame
+
+include "StabFem.idp";
+
+include "getARGV.idp" // Arguments instead of pipeline
+
+include "SF_Geom.edp"; //include r1,r2,xmax,rmax
+////////////////////////////////////////////////////////////////////
+//
+//		CHAPTER 1 : selection of parameters		
+//
+
+
+
+/*physical parameters*/
+real Re,Da,Ze,DeltaT,Pr,Le;
+real phi,sratio;
+
+//for Sutherland law
+real powerViscosity;
+real Amiu = 1.7033;
+real Tmiu = 0.5687;
+
+cout << "$$  Physical parameters " << endl;
+
+Re = getARGV("-Re",0.);
+
+Da = getARGV("-Da",0.);
+Ze = getARGV("-Ze",0.);
+DeltaT = getARGV("-DeltaT",0.);
+Pr = getARGV("-Pr",0.);
+Le = getARGV("-Le",0.);
+
+sratio = getARGV("-sratio",4.0);
+phi = getARGV("-phi",0.7);
+powerViscosity = getARGV("-powerViscosity",1.0);
+
+cout << "Re = " << Re << ","<<"Da = " << Da << ","<<"Ze = " << Ze << endl;
+cout << "DeltaT = " << DeltaT  << ","<<"Pr = " << Pr << ","<<"Le = " << Le << endl;
+cout << "sratio = " << sratio  << ","<<"phi = " << phi << endl;
+cout << "powerViscosity = " << powerViscosity << endl;
+
+//for sponge layer
+real ifsg = getARGV("-ifsg",1.0);
+real rsg = getARGV("-rsg",2.7);
+real xsg = getARGV("-xsg",13.6);
+real alphasg = getARGV("-alphasg",0.05);
+real gammasg = getARGV("-gammasg",4.0);
+
+/*eigenvalue problem parameters*/
+real shiftr = getARGV("-shift_r",1.);
+real shifti = getARGV("-shift_i",1.);
+complex shift = shiftr + 1i*shifti;
+string iadjoint = getARGV("-type","D");
+int nev = getARGV("-nev",1);
+
+cout << "shift = " << shift << endl;
+cout << "Method " << iadjoint << endl;
+cout << "nev = " << nev << endl;       
+
+////////////////////////////////////////////////////////////////////
+//
+//		CHAPTER 2 : read input files	
+//
+
+// 
+// First read mesh
+//
+
+func Pk = [P2, P2, P2, P2, P2, P1];
+mesh th;
+th=readmesh(ffdatadir+"mesh.msh"); 
+
+/* Definition of FEspaces */
+fespace Xh(th,P2);
+fespace Mh(th,P1);
+fespace XXXXXMh(th,Pk);     //   Local mesh 
+
+XXXXXMh<complex>  [ux,ur,utheta,uYc,uT,up];        //eigenvalue solution field
+XXXXXMh<complex>  [vx,vr,vtheta,vYc,vT,vp];        // test function field
+XXXXXMh  [ubx,ubr,ubtheta,ubYc,ubT,ubp];     // Local solution field 
+
+//
+//  Load baseflow   
+ifstream file(ffdatadir+"BaseFlow.txt");
+file >> ubx[]; 
+
+
+
+
+//////////////////////////////////////////////////////////////////////////////////
+//
+//		CHAPTER 3 : Customizable macros 	
+//
+
+// 
+macro div(u) (dx(u#x)+dy(u#r)+(u#r)/y)
+// macro for divergence 
+macro Grad(u) [[dx(u#x), dx(u#r), dx(u#theta)], 
+               [dy(u#x), dy(u#r), dy(u#theta)],
+               [0.0, -(u#theta)/y, (u#r)/y]] 
+// macro for rate-of-deformation tensor
+macro D(u) [[dx(u#x), 0.5*(dx(u#r)+dy(u#x)),0.5*dx(u#theta)],
+            [0.5*(dx(u#r)+dy(u#x)), dy(u#r),0.5*(dy(u#theta)-(u#theta)/y)],
+            [0.5*dx(u#theta),0.5*(dy(u#theta)-(u#theta)/y),u#r/y]] 
+// macro for rate-of-deformation tensor
+macro Conv(ua,ub,v) ( 
+              ((ua#x*dx(ub#x)+ua#r*dy(ub#x))+(ub#x*dx(ua#x)+ub#r*dy(ua#x)))*v#x 
+            + ((ua#x*dx(ub#r)+ua#r*dy(ub#r)-(ua#theta)*(ub#theta)/y)+(ub#x*dx(ua#r)+ub#r*dy(ua#r)-(ua#theta)*(ub#theta)/y))*v#r
+            + ((ua#x*dx(ub#theta)+ua#r*dy(ub#theta)+(ua#theta)*(ub#r)/y)+(ub#x*dx(ua#theta)+ub#r*dy(ua#theta)+(ub#theta)*(ua#r)/y))*(v#theta)             
+                    )                  
+// macro for mutual convection operator
+macro DT(u,v) [[dx(u#T)*v#x,dx(u#T)*v#r,dx(u#T)*v#theta], 
+               [dy(u#T)*v#x,dy(u#T)*v#r,dy(u#T)*v#theta],
+               [0.0*u#T*v#x, 0.0*u#T*v#r, 0.0*u#T*v#theta]]
+// macro for grad(T)v
+
+//note : DaYExpT(UbG) = Reactionsource(UbG)*UbGT
+//       dDaYExpT(UbG,uG) = dReactionsource(UbG,uG)*UbGT - Reactionsource(UbG)*uGT
+
+macro DaYExpT(u) (Da*u#Yc*sqrt(sratio)*sqrt(u#Yc+1.0/phi-1.0)/sqrt(u#T)*exp(Ze*((1.0+DeltaT)/DeltaT)*(1.0-(1.0+DeltaT)/u#T)))
+// macro for source term (ReactionRate*T)
+
+macro dDaYExpT(U,u) Da*sqrt(sratio)*exp(Ze*((1.0+DeltaT)/DeltaT)*(1.0-(1.0+DeltaT)/U#T))*((u#Yc*sqrt(U#Yc+1.0/phi-1.0)/sqrt(U#T)+U#Yc*0.5/sqrt(U#Yc+1.0/phi-1.0)*u#Yc/sqrt(U#T)-0.5*u#T/(U#T)*U#Yc*sqrt(U#Yc+1.0/phi-1.0)/sqrt(U#T))+Ze/DeltaT*(1+DeltaT)^2*((U#Yc)*sqrt(U#Yc+1.0/phi-1.0)/sqrt(U#T))/(U#T)^2*(u#T))
+// macro for d(ReactionRate*T)
+
+macro Reactionsource(u) (Da*u#Yc*sqrt(sratio)*sqrt(u#Yc+1.0/phi-1.0)/(sqrt(u#T)*u#T)*exp(Ze*((1.0+DeltaT)/DeltaT)*(1.0-(1.0+DeltaT)/u#T)))
+// macro for ReactionRate
+
+macro dReactionsource(U,u) ((Da/(U#T*sqrt(U#T))*sqrt(sratio)*exp(Ze*(1.0+DeltaT)/DeltaT*(1.0-(1.0+DeltaT)/U#T))*(sqrt(U#Yc+1.0/phi-1.0)+U#Yc*0.5/sqrt(U#Yc+1.0/phi-1.0)))*u#Yc+(Da*U#Yc*sqrt(sratio)*sqrt(U#Yc+1.0/phi-1.0)*exp(Ze*(1.0+DeltaT)/DeltaT*(1.0-(1.0+DeltaT)/U#T))*(Ze*(1.0+DeltaT)^2/(DeltaT*U#T)-1.5)/((U#T)^2*sqrt(U#T)))*u#T)
+// macro for d(ReactionRate)
+
+// macro for transport coefficient and sponge layer
+macro miu(u) (Amiu*((u#T)^powerViscosity)/(1.0+Tmiu/u#T))/sg(x,y)//EOM
+macro lambda(u) (Amiu*((u#T)^powerViscosity)/(1.0+Tmiu/u#T))/sg(x,y) //EOM
+macro rhoD(u) (Amiu*((u#T)^powerViscosity)/(1.0+Tmiu/u#T))/sg(x,y)//EOM
+macro dmiudT(u) (Amiu*(powerViscosity*(u#T)^(powerViscosity-1.0))/(1.0+Tmiu/u#T)+Amiu*((u#T)^powerViscosity)*(Tmiu/(u#T)^2)/(1.0+Tmiu/u#T)^2)/sg(x,y)   //EOM
+macro dlambdadT(u) (Amiu*(powerViscosity*(u#T)^(powerViscosity-1.0))/(1.0+Tmiu/u#T)+Amiu*((u#T)^powerViscosity)*(Tmiu/(u#T)^2)/(1.0+Tmiu/u#T)^2)/sg(x,y)  //EOM
+macro drhoDdT(u) (Amiu*(powerViscosity*(u#T)^(powerViscosity-1.0))/(1.0+Tmiu/u#T)+Amiu*((u#T)^powerViscosity)*(Tmiu/(u#T)^2)/(1.0+Tmiu/u#T)^2)/sg(x,y)  //EOM
+
+macro sg(x,y)
+(1.0+ifsg*(0.0*(x<=xsg)*(y<=rsg)+((alphasg-1.0)*(0.5+0.5*tanh(gammasg*tan(-pi/2.0+pi*abs(x-xsg)/(xmax-xsg)))))*(x>xsg)*(y<=rsg)+((alphasg-1.0)*(0.5+0.5*tanh(gammasg*tan(-pi/2.0+pi*abs(y-rsg)/(rmax-rsg)))))*(x<=xsg)*(y>rsg)+(((alphasg-1.0)*(0.5+0.5*tanh(gammasg*tan(-pi/2.0+pi*abs(x-xsg)/(xmax-xsg)))))+((alphasg-(1.0+(alphasg-1.0)*(0.5+0.5*tanh(gammasg*tan(-pi/2.0+pi*abs(x-xsg)/(xmax-xsg))))))*(0.5+0.5*tanh(gammasg*tan(-pi/2.0+pi*abs(y-rsg)/(rmax-rsg))))))*(x>xsg)*(y>rsg)))
+//EOM
+
+//////////////////////////////////////////////////////////////////////////////////
+//
+//		CHAPTER 4 : declare the problems 	
+//
+// varf for generalized eigenvalue problem: 
+ // note: u(t,x) = u^{hat}(x) * exp(lambda*t)
+
+varf  LNSE ([ux,ur,utheta,uYc,uT,up],[vx,vr,vtheta,vYc,vT,vp]) =
+
+//Jacobian parts
+
+    int2d(th)(
+    
+        // if u(t,x) = u^{hat}(x) * exp(-lambda*t) then without -1.0
+        -1.0*( 
+          
+ //eqn1 for u    
+    	(
+    		Conv(u,ub,v) 
+    	      -up*(dx(ubT)*vx+dy(ubT)*vr+ubT*div(v))
+    	      -ubp*(dx(uT)*vx+dy(uT)*vr+uT*div(v))    	         	         	      
+    	      +2.0/Re*dmiudT(ub)*uT*ubT*(D(ub):D(v))
+    	      +2.0/Re*dmiudT(ub)*uT*(D(ub):DT(ub,v)) 
+    	      +2.0/Re*miu(ub)*ubT*(D(u):D(v)) 
+     	      +2.0/Re*miu(ub)*(D(u):DT(ub,v))  
+    	      +2.0/Re*miu(ub)*uT*(D(ub):D(v))      	       	        	      
+    	      +2.0/Re*miu(ub)*(D(ub):DT(u,v))
+    	)
+    	+   
+ //eqn2 for Yc    
+    	(
+    		(ubx*dx(uYc)+ubr*dy(uYc))*vYc
+    	       +(ux*dx(ubYc)+ur*dy(ubYc))*vYc
+    	      //  +(dReactionsource(ub,u)*ubT+Reactionsource(ub)*uT)*vYc
+    	       +dDaYExpT(ub,u)*vYc   	       
+    	       +1.0/(Re*Pr*Le)*drhoDdT(ub)*uT*ubT*(dx(ubYc)*dx(vYc)+dy(ubYc)*dy(vYc))
+      	       +1.0/(Re*Pr*Le)*drhoDdT(ub)*uT*(dx(ubYc)*dx(ubT)+dy(ubYc)*dy(ubT))*vYc
+     	       +1.0/(Re*Pr*Le)*rhoD(ub)*ubT*(dx(uYc)*dx(vYc)+dy(uYc)*dy(vYc))
+    	       +1.0/(Re*Pr*Le)*rhoD(ub)*(dx(uYc)*dx(ubT)+dy(uYc)*dy(ubT))*vYc     	       
+    	       +1.0/(Re*Pr*Le)*rhoD(ub)*uT*(dx(ubYc)*dx(vYc)+dy(ubYc)*dy(vYc))
+    	       +1.0/(Re*Pr*Le)*rhoD(ub)*(dx(ubYc)*dx(uT)+dy(ubYc)*dy(uT))*vYc
+    	)
+    	+   
+ //eqn3 for T    
+    	(
+    		(ubx*dx(uT)+ubr*dy(uT))*vT
+    	       +(ux*dx(ubT)+ur*dy(ubT))*vT
+    	      // -DeltaT*(dReactionsource(ub,u)*ubT+Reactionsource(ub)*uT)*vT 
+    	       -DeltaT*dDaYExpT(ub,u)*vT   	  	
+    	       +1.0/(Re*Pr)*dlambdadT(ub)*uT*ubT*(dx(ubT)*dx(vT)+dy(ubT)*dy(vT))
+    	       +1.0/(Re*Pr)*dlambdadT(ub)*uT*(dx(ubT)*dx(ubT)+dy(ubT)*dy(ubT))*vT    	       
+    	       +1.0/(Re*Pr)*lambda(ub)*ubT*(dx(uT)*dx(vT)+dy(uT)*dy(vT))
+    	       +1.0/(Re*Pr)*lambda(ub)*(dx(uT)*dx(ubT)+dy(uT)*dy(ubT))*vT    	       
+    	       +1.0/(Re*Pr)*lambda(ub)*uT*(dx(ubT)*dx(vT)+dy(ubT)*dy(vT))
+    	       +1.0/(Re*Pr)*lambda(ub)*(dx(ubT)*dx(uT)+dy(ubT)*dy(uT))*vT
+    	)
+    	+             
+ //eqn4 for p (continue equation)    
+    	(
+       	//-DeltaT*(dReactionsource(ub,u)*ubT+Reactionsource(ub)*uT)*vp
+       	-DeltaT*dDaYExpT(ub,u)*vp
+    	       +1.0/(Re*Pr)*dlambdadT(ub)*uT*ubT*(dx(ubT)*dx(vp)+dy(ubT)*dy(vp))
+    	       +1.0/(Re*Pr)*dlambdadT(ub)*uT*(dx(ubT)*dx(ubT)+dy(ubT)*dy(ubT))*vp
+    	       +1.0/(Re*Pr)*lambda(ub)*ubT*(dx(uT)*dx(vp)+dy(uT)*dy(vp))
+    	       +1.0/(Re*Pr)*lambda(ub)*(dx(uT)*dx(ubT)+dy(uT)*dy(ubT))*vp    	       
+    	       +1.0/(Re*Pr)*lambda(ub)*uT*(dx(ubT)*dx(vp)+dy(ubT)*dy(vp))
+    	       +1.0/(Re*Pr)*lambda(ub)*(dx(ubT)*dx(uT)+dy(ubT)*dy(uT))*vp       	       
+    	       +div(u)*ubT*vp    	       
+    	       +div(ub)*uT*vp
+    	)               
+             
+        )*y
+      
+        )
+             
+ //Boundary conditions          
+	+ on(1,ux=0.0,ur=0.0,utheta=0.0,uT=0.0,uYc=0.0)
+	+ on(211,ux=0.0,ur=0.0,utheta=0.0)
+	+ on(212,ux=0.0,ur=0.0,utheta=0.0,uT=0.0) 
+	+ on(213,ux=0.0,ur=0.0,utheta=0.0,uT=0.0)		 
+	+ on(214,ux=0.0,ur=0.0,utheta=0.0,uT=0.0) 
+	+ on(51,ur=0.0,utheta=0.0,uT=0.0,uYc=0.0)
+	+ on(6,ur=0.0,utheta=0.0);
+ 
+ varf LNSEadjoint ([ux,ur,utheta,uYc,uT,up],[vx,vr,vtheta,vYc,vT,vp]) =
+
+//Jacobian parts
+
+    int2d(th)(
+
+        -1.0*( 
+          
+ //eqn1 for u    
+    	(
+    		Conv(v,ub,u) 
+    	      -vp*(dx(ubT)*ux+dy(ubT)*ur+ubT*div(u))
+    	      -ubp*(dx(vT)*ux+dy(vT)*ur+vT*div(u))    	         	         	      
+    	      +2.0/Re*dmiudT(ub)*vT*ubT*(D(ub):D(u))
+    	      +2.0/Re*dmiudT(ub)*vT*(D(ub):DT(ub,u)) 
+    	      +2.0/Re*miu(ub)*ubT*(D(v):D(u)) 
+     	      +2.0/Re*miu(ub)*(D(v):DT(ub,u))  
+    	      +2.0/Re*miu(ub)*vT*(D(ub):D(u))      	       	        	      
+    	      +2.0/Re*miu(ub)*(D(ub):DT(v,u))
+    	)
+    	+   
+ //eqn2 for Yc    
+    	(
+    		(ubx*dx(vYc)+ubr*dy(vYc))*uYc
+    	       +(vx*dx(ubYc)+vr*dy(ubYc))*uYc
+    	      //  +(dReactionsource(ub,u)*ubT+Reactionsource(ub)*uT)*vYc
+    	       +dDaYExpT(ub,v)*uYc   	       
+    	       +1.0/(Re*Pr*Le)*drhoDdT(ub)*vT*ubT*(dx(ubYc)*dx(uYc)+dy(ubYc)*dy(uYc))
+      	       +1.0/(Re*Pr*Le)*drhoDdT(ub)*vT*(dx(ubYc)*dx(ubT)+dy(ubYc)*dy(ubT))*uYc
+     	       +1.0/(Re*Pr*Le)*rhoD(ub)*ubT*(dx(vYc)*dx(uYc)+dy(vYc)*dy(uYc))
+    	       +1.0/(Re*Pr*Le)*rhoD(ub)*(dx(vYc)*dx(ubT)+dy(vYc)*dy(ubT))*uYc     	       
+    	       +1.0/(Re*Pr*Le)*rhoD(ub)*vT*(dx(ubYc)*dx(uYc)+dy(ubYc)*dy(uYc))
+    	       +1.0/(Re*Pr*Le)*rhoD(ub)*(dx(ubYc)*dx(vT)+dy(ubYc)*dy(vT))*uYc
+    	)
+    	+   
+ //eqn3 for T    
+    	(
+    		(ubx*dx(vT)+ubr*dy(vT))*uT
+    	       +(vx*dx(ubT)+vr*dy(ubT))*uT
+    	      // -DeltaT*(dReactionsource(ub,u)*ubT+Reactionsource(ub)*uT)*vT 
+    	       -DeltaT*dDaYExpT(ub,v)*uT   	  	
+    	       +1.0/(Re*Pr)*dlambdadT(ub)*vT*ubT*(dx(ubT)*dx(uT)+dy(ubT)*dy(uT))
+    	       +1.0/(Re*Pr)*dlambdadT(ub)*vT*(dx(ubT)*dx(ubT)+dy(ubT)*dy(ubT))*uT    	       
+    	       +1.0/(Re*Pr)*lambda(ub)*ubT*(dx(vT)*dx(uT)+dy(vT)*dy(uT))
+    	       +1.0/(Re*Pr)*lambda(ub)*(dx(vT)*dx(ubT)+dy(vT)*dy(ubT))*uT    	       
+    	       +1.0/(Re*Pr)*lambda(ub)*vT*(dx(ubT)*dx(uT)+dy(ubT)*dy(uT))
+    	       +1.0/(Re*Pr)*lambda(ub)*(dx(ubT)*dx(vT)+dy(ubT)*dy(vT))*uT
+    	)
+    	+             
+ //eqn4 for p (continue equation)    
+    	(
+       	//-DeltaT*(dReactionsource(ub,u)*ubT+Reactionsource(ub)*uT)*vp
+       	-DeltaT*dDaYExpT(ub,v)*up
+    	       +1.0/(Re*Pr)*dlambdadT(ub)*vT*ubT*(dx(ubT)*dx(up)+dy(ubT)*dy(up))
+    	       +1.0/(Re*Pr)*dlambdadT(ub)*vT*(dx(ubT)*dx(ubT)+dy(ubT)*dy(ubT))*up
+    	       +1.0/(Re*Pr)*lambda(ub)*ubT*(dx(vT)*dx(up)+dy(vT)*dy(up))
+    	       +1.0/(Re*Pr)*lambda(ub)*(dx(vT)*dx(ubT)+dy(vT)*dy(ubT))*up    	       
+    	       +1.0/(Re*Pr)*lambda(ub)*vT*(dx(ubT)*dx(up)+dy(ubT)*dy(up))
+    	       +1.0/(Re*Pr)*lambda(ub)*(dx(ubT)*dx(vT)+dy(ubT)*dy(vT))*up       	       
+    	       +div(v)*ubT*up    	       
+    	       +div(ub)*vT*up
+    	)               
+             
+        )*y
+
+        )
+             
+ //Boundary conditions          
+	+ on(1,ux=0.0,ur=0.0,utheta=0.0,uT=0.0,uYc=0.0)
+	+ on(211,ux=0.0,ur=0.0,utheta=0.0)
+	+ on(212,ux=0.0,ur=0.0,utheta=0.0,uT=0.0) 
+	+ on(213,ux=0.0,ur=0.0,utheta=0.0,uT=0.0)		 
+	+ on(214,ux=0.0,ur=0.0,utheta=0.0,uT=0.0) 
+	+ on(51,ur=0.0,utheta=0.0,uT=0.0,uYc=0.0)
+	+ on(6,ur=0.0,utheta=0.0);
+	
+	 
+ varf MassMatrix([ux,ur,utheta,uYc,uT,up],[vx,vr,vtheta,vYc,vT,vp]) =            
+ //Mass matrix parts             
+    int2d(th)(
+            (ux*vx+ur*vr+utheta*vtheta+uYc*vYc+uT*vT)*y
+             )
+ //Boundary conditions          
+	+ on(1,ux=0.0,ur=0.0,utheta=0.0,uT=0.0,uYc=0.0)
+	+ on(211,ux=0.0,ur=0.0,utheta=0.0)
+	+ on(212,ux=0.0,ur=0.0,utheta=0.0,uT=0.0) 
+	+ on(213,ux=0.0,ur=0.0,utheta=0.0,uT=0.0)		 
+	+ on(214,ux=0.0,ur=0.0,utheta=0.0,uT=0.0) 
+	+ on(51,ur=0.0,utheta=0.0,uT=0.0,uYc=0.0)
+	+ on(6,ur=0.0,utheta=0.0);
+
+////// BUILD B-MATRIX //////////////////////////////////////////////////////////////
+matrix<complex> A= LNSE(XXXXXMh,XXXXXMh,tgv=-1);
+matrix<complex> B= MassMatrix(XXXXXMh,XXXXXMh,tgv=-10);  //////// see freefem++doc.pdf for the solver 
+
+//////////////////////////////////////////////////////////////////////////////////
+//
+
+////////////////////////////////////////////////////////////////////////////////////
+
+A.CSR;
+ofstream fileA("A.txt");
+fileA << A <<endl;
+cout << "$$ A done "<<endl;
+
+B.CSR;
+ofstream fileB("B.txt");
+fileB << B <<endl;
+cout << "$$ B done "<<endl;
+
+cout << "$$ SUCCESSFULLY LEAVING Stab_PREMIXED_LM.edp " << endl;

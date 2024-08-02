@@ -1,0 +1,239 @@
+//  PROGRAM Resolvent_2D.edp
+//
+//	Output the matrix for resolvent analysis
+//
+//
+//  INPUT PARAMETERS (from getARGV)
+//   	Re , shift(Re,im) , Symmetry, Type, nev
+//
+//
+//	INPUT FILES :
+//		BaseFlow.txt	-> base flow
+// 		mesh.msh 			->  mesh in Freefem format
+//  OUTPUT FILES :
+//  	A.txt   (txt format for FreeFem)
+//  	B.txt   (txt format for FreeFem)
+//     MF.txt
+//     MQ.txt
+//      P.txt
+// 	ERROR MANAGEMENT :
+//      if shift-invert iteration diverges, return value is 202 (managed by macro)
+//
+// History :
+// on 4/12/2023 Lu Chen
+// on 7/7/2023 Lu Chen upadated for other matrix Mf,Mq,P
+
+cout << "$$$$ ENTERING Resolvent_2D.edp " << endl << "$$" << endl;
+
+
+include "StabFem.idp";
+load "lapack"
+
+
+IFMACRO(!Pk)
+macro Pk [P2,P2,P1] //FEspace for pressure
+macro Pkstring() "P2P2P1" //
+ENDIFMACRO
+
+
+//////////////////////////////////////////////////////////////////////////////////
+//
+//		CHAPTER 1 : parameters
+//
+
+IFMACRO(!SFInputParametersStab)
+macro SFInputParametersStab()
+    cout << "$$ PARAMETERS READ FROM GETARGV : " << endl << endl;
+	real Re = getARGV("-Re",0.);
+	cout << "$$ Reynolds                 : " <<  Re << endl;
+	real shiftr = getARGV("-shift_r",0.);
+    real shifti = getARGV("-shift_i",0.);
+	cout << "$$ SHIFT (re,im)            :  " << shiftr << " " << shifti << endl;
+	complex shift = 1i*shifti+shiftr;
+	string symmetry=getARGV("-Symmetry","A");
+	cout << "$$ Symmetry properties : " << symmetry << endl;
+	string iadjoint = getARGV("-type","D");
+	cout << "$$ Direct (D), Adjoint (A) : " <<  iadjoint << endl;
+	int nev = getARGV("-nev",10);
+    cout << "$$ nev     : " << nev << endl;
+
+	cout << endl << "$$ ### PARAMETERS SELECTED : " << endl;
+	cout << "$$ Re = " << Re<< endl;
+	cout << "$$ shift = " << shift << endl;
+
+    int isadjoint = 0;
+	if (iadjoint =="D") {cout << "$$ DIRECT PROBLEM" << endl;}
+	else if (iadjoint =="A") {cout << "$$ ADJOINT PROBLEM (discrete)" << endl; isadjoint=1;}
+	else {cout << "$$ ERROR WHEN SELECTING PROBLEM TYPE" << endl;};
+
+
+	cout << "$$ nev = " << nev << endl;
+	//EOM
+ENDIFMACRO
+
+SFInputParametersStab;
+
+//////////////////////////////////////////////////////////////////////////////////
+//
+//		CHAPTER 2 : read files
+//
+
+mesh th=readmesh(themeshfilename);                    ///// Read mesh
+
+fespace Xh(th,P2,periodic=MESHPERIODICITY);             ////// f.e. space for vel.
+fespace Mh(th,P1,periodic=MESHPERIODICITY);            ////// f.e. space for pressure
+fespace XXh(th,[P2,P2],periodic=MESHPERIODICITY);           
+fespace XXMh(th,Pk,periodic=MESHPERIODICITY); ////// f.e. space for triplet [u,v,p]
+XXMh<complex> [ux,uy,up];                 ///////  -> unknown for the Navier-Stokes problem
+XXMh [vx,vy,q];                          ///////  -> test for Navier-Stokes 
+XXMh [Ubx,Uby,Pb];                       ///////  -> Base Flow
+
+XXh [fx,fy];      // forcing
+XXh [fxv,fyv];    // test for forcing
+
+
+
+int sym;
+
+if (symmetry =="N"||symmetry=="0"||int1d(th,6)(1)==0) {cout << "$$ No symmetry axis" << endl;sym=0;}
+else if (symmetry =="S"||symmetry=="1") {cout << "$$ Symmetric modes" << endl;sym=1;}
+else if (symmetry =="A"||symmetry=="-1") {cout << "$$ Antiymmetric modes" << endl;sym=-1;};
+
+real ReB;
+{
+ifstream cbin(ffdatadir+"BaseFlow.txt");
+cbin >> Ubx[] >> ReB;
+}
+if(Re!= ReB)
+{
+cout << "Warning : Re != ReB, is that really what you mean ???" << endl;
+}
+
+	real nu=1./Re;
+	// If Nu is something else than 1/Re define a macro CUSTOMnu in your StabFem.idp file
+    IFMACRO(CUSTOMnu)
+    nu = CUSTOMnu;
+    ENDIFMACRO
+
+
+//////////////////////////////////////////////////////////////////////////////////
+//
+//		CHAPTER 3 : Customizable macros
+//
+// COMPLEX MAPPING (in case)
+include "Param_Mapping.edp"
+// (if not relevant you can remove this line, or create a blank file "Param_Mapping.edp".)
+
+// A. to disable complex mapping in case it is not needed
+IFMACRO(!dX)
+macro dX(a) dx(a) //EOM
+macro dY(a) dy(a) //EOM
+macro JJ   1. //EOM
+ENDIFMACRO
+IFMACRO(DEFMapping)
+DEFMapping; // This macro computes the functions involved in complex mapping
+ENDIFMACRO
+
+//
+// Note : this solver requires three macros BoundaryConditionsStability, SFWriteMode, NormalizeMode.
+// Below are "default" values for these macros, to be used in the most basic cases. If you want to
+// customize these macros don't modify them here but copy them to your StabFem.idp file.
+//
+
+IFMACRO(!BoundaryconditionsStability)
+macro BoundaryconditionsStability(u,v,symmetry)
+	           on(1,7,u#x=0,u#y=0.0) 		/* label 1 = inlet */
+             + on(2,21,22,23,u#x=0.0,u#y=0.0) 	/* label 2 = wall */
+             							/* Label 3 is outlet : No-stress as a result of integration by parts, nothing to write here ! */
+             + on(4,u#y=0.0)  			/* Label 4 is 'slip' or 'symmetry' condition on a horizontal boundary */
+             + on(5,u#x=0.0)  			/* Label 5 is 'slip' or 'symmetry' condition on a vertical boundary */
+             + int1d(th,6)(u#x*v#x*1e30*(symmetry=="A")+u#y*v#y*1e30*(symmetry=="S"))
+             							/* Label 6 is a symmmetry axis */
+             							/* NB label 7 -> porous surface or deformable solid ; label 8 -> curved, deformable surface ; label 9 -> inner surface */
+//EOM
+ENDIFMACRO
+
+
+IFMACRO(!NormalizeMode)
+macro NormalizeMode(u)
+{
+real NORM = sqrt(int2d(th)(abs(u#x)^2+abs(u#y)^2));
+u#x[] = u#x[]/NORM;
+}
+//EOM
+ENDIFMACRO
+
+
+macro div(u) (dX(u#x)+dY(u#y))// macro for divergence
+macro Conv(ua,ub,v) (
+              ((ua#x*dX(ub#x)+ua#y*dY(ub#x))+(ub#x*dX(ua#x)+ub#y*dY(ua#x)))*v#x
+            + ((ua#x*dX(ub#y)+ua#y*dY(ub#y))+(ub#x*dX(ua#y)+ub#y*dY(ua#y)))*v#y
+                    ) // macro for mutual convection operator
+macro D(u) [[dX(u#x), .5*(dX(u#y)+dY(u#x))], [.5*(dX(u#y)+dY(u#x)), dY(u#y)]] // macro for rate-of-deformation tensor
+macro Diffusion(nu,ux,uy,vx,vy)  (-nu*( dX(ux)*dX(vx)+dY(ux)*dY(vx)+dX(uy)*dX(vy)+dY(uy)*dY(vy))) // integration by parts of nu (v.Delta u)
+
+
+
+real eps = 1e-12; // desingularisation term for matrix B, useful with some solvers
+
+
+//////////////////////////////////////////////////////////////////////////////////
+//
+//		CHAPTER 4 : Definition of operators
+//
+/////////////////////////////////////////////////////////////////////////////////
+////////    ---> varf for generalized eigenvalue problem: 		<--- //////////
+////////////////////////////////////////////////////////////////////////////////////
+
+////// BUILD A-MATRIX///////////////////////////
+varf   LNSE ([ux,uy,up],[vx,vy,q]) =
+   int2d(th)(
+   	     (-2*nu*(D(u):D(v))
+             + up*div(v)
+             + div(u)*q
+             - Conv(u,Ub,v)
+             )*JJ
+             )
+ + BoundaryconditionsStability(u,v,symmetry);
+
+matrix<complex> A;
+A=LNSE(XXMh,XXMh,tgv=-1);
+
+////// BUILD B-MATRIX///////////////////////////
+	varf b([ux,uy,up],[vx,vy,q]) = int2d(th)( (ux*vx+uy*vy)*JJ );
+	matrix<complex> B= b(XXMh,XXMh,tgv=-10);  
+
+////// BUILD MQ-MATRIX///////////////////////////
+	varf Mq([ux,uy,up],[vx,vy,q]) = int2d(th)( (ux*vx+uy*vy)*JJ );
+	matrix<real> MQ= Mq(XXMh,XXMh);  
+
+////// BUILD MF-MATRIX///////////////////////////
+	varf Mf([fx,fy],[fxv,fyv]) = int2d(th)( (fx*fxv+fy*fyv)*JJ );
+	matrix<real> MF= Mf(XXh,XXh); 
+
+////// BUILD P-MATRIX///////////////////////////
+	varf pint([fx,fy],[ux,uy,up]) = int2d(th)( (fx*ux+fy*uy)*JJ );
+	matrix<real> PINT= pint(XXh,XXMh); 
+
+
+cout << " Finish building matrix " << endl ;
+
+
+A.CSR;
+ofstream fileA("A.txt");
+fileA << A <<endl;
+B.CSR;
+ofstream fileB("M.txt");
+fileB << B <<endl;
+MF.CSR;
+ofstream fileMF("MF.txt");
+fileMF << MF <<endl;
+MQ.CSR;
+ofstream fileMQ("MQ.txt");
+fileMQ << MQ <<endl;
+PINT.CSR;
+ofstream fileP("P.txt");
+fileP << PINT <<endl;
+
+
+cout << "$$$$ SUCCESSFULLY LEAVING Resolvent_2D.edp " << endl ;
